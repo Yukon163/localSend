@@ -1,5 +1,6 @@
 package com.yukon.localsend
 
+import android.content.Context
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -13,42 +14,92 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import com.yukon.localsend.ui.theme.LocalSendTheme
-
+import android.net.wifi.WifiManager
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.ui.unit.dp
 
 
 class MainActivity : ComponentActivity() {
+    private var multicastLock: WifiManager.MulticastLock? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val message = RustSDK.helloRromRust("/sdcard/Download/work/d.java")
-        Log.d("YukonTest", "从SDK拿到的信息: $message")
+        setupMulticastLock()
 
+        try {
+            RustSDK.startDiscovery()
+            Log.d("YukonTest", "Rust 发现服务启动成功")
+        } catch (e: Exception) {
+            Log.e("YukonTest", "Rust 发现服务启动失败 ${e.message}")
+        }
+
+//        RustSDK.testCallback()
         enableEdgeToEdge()
         setContent {
             LocalSendTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    Greeting(
-                        msg = "从SDK拿到的信息: $message",
+                    DiscoveryScreen(
                         modifier = Modifier.padding(innerPadding)
                     )
                 }
             }
         }
     }
-}
 
-@Composable
-fun Greeting(msg: String, modifier: Modifier = Modifier) {
-    Text(
-        text = msg,
-        modifier = modifier
-    )
-}
+    private fun setupMulticastLock() {
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        multicastLock = wifiManager.createMulticastLock("localsend_lock").apply {
+            setReferenceCounted(true)
+            acquire()
+        }
+    }
 
-@Preview(showBackground = true)
-@Composable
-fun GreetingPreview() {
-    LocalSendTheme {
-        Greeting("Android")
+    override fun onDestroy() {
+        super.onDestroy()
+        multicastLock?.let {
+            if (it.isHeld) it.release()
+        }
     }
 }
+
+@Composable
+fun DiscoveryScreen(modifier: Modifier = Modifier) {
+    val discoveredDevices = DeviceManager.devices
+
+    Column(modifier.fillMaxSize().padding(16.dp)){
+        Text(
+            text = "局域网设备发现中...",
+            style = MaterialTheme.typography.headlineSmall,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+
+        HorizontalDivider()
+
+        if (discoveredDevices.isEmpty()) {
+            Text(
+                text = "no device",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.secondary,
+                modifier = Modifier.padding(top = 16.dp)
+            )
+        } else {
+            LazyColumn {
+                items(discoveredDevices) { device ->
+                    Text(
+                        text = "$device",
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.padding(vertical = 12.dp)
+                    )
+                    HorizontalDivider(thickness = 0.5.dp)
+                }
+            }
+        }
+
+    }
+}
+
