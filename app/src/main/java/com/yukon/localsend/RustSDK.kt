@@ -9,11 +9,12 @@ object RustSDK {
 
     @JvmStatic
     fun onDeviceFound(deviceInfo: String) {
-        Log.d("YukonTest", "收到 SDK 回传设备: $deviceInfo")
-        DeviceManager.addDevice(deviceInfo)
+        // 切换到主线程刷新一下ui
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            DeviceManager.addDevice(deviceInfo)
+        }
     }
 
-    external fun helloRromRust(path: String): String
-    external fun startDiscovery()
-    external fun testCallback()
+    external fun startDiscovery(userAlias: String)
+    external fun discoverOnce()
 }
