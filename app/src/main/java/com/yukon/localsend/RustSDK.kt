@@ -4,7 +4,7 @@ import android.util.Log
 
 object RustSDK {
     init {
-        System.loadLibrary("locsd_lib")
+        System.loadLibrary("localsend_core")
     }
 
     private fun runOnMain(block: () -> Unit) {

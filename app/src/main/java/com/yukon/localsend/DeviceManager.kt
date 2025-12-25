@@ -7,8 +7,25 @@ object DeviceManager {
     var myName: String = "Unknown"
 
     fun addDevice(info: String) {
-        if (!devices.contains(info)) {
-            devices.add(info)
+        val parts = info.split("|")
+        if (parts.size >= 3) {
+            val ip = parts[2]
+            val index = devices.indexOfFirst {
+                val existingParts = it.split("|")
+                existingParts.size >= 3 && existingParts[2] == ip
+            }
+
+            if (index != -1) {
+                if (devices[index] != info) {
+                    devices[index] = info
+                }
+            } else {
+                devices.add(info)
+            }
+        } else {
+            if (!devices.contains(info)) {
+                devices.add(info)
+            }
         }
     }
 

@@ -372,12 +372,12 @@ fun ReceiveScreen() {
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Text(
-                    text = "状态: 准备接收 (端口 4061)",
+                    text = "状态: 准备接收 (端口 4060)",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.outline
                 )
             }
-        }
+        }//
 
         Text(text = status, style = MaterialTheme.typography.headlineSmall)
 
