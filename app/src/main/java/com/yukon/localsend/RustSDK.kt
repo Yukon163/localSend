@@ -44,8 +44,33 @@ object RustSDK {
         }
     }
 
-    external fun startDiscovery(userAlias: String)
+    var currentAlias: String? = null
+        private set
+
+    private var isDiscoveryStarted = false
+    private var isFileServerStarted = false
+
+    fun startDiscoverySafe(userAlias: String) {
+        if (isDiscoveryStarted) {
+            Log.d("RustSDK", "Discovery service already started, skipping.")
+            return
+        }
+        startDiscovery(userAlias)
+        isDiscoveryStarted = true
+        currentAlias = userAlias
+    }
+
+    fun startFileServerSafe(saveDir: String) {
+        if (isFileServerStarted) {
+            Log.d("RustSDK", "File server already started, skipping.")
+            return
+        }
+        startFileServer(saveDir)
+        isFileServerStarted = true
+    }
+
+    private external fun startDiscovery(userAlias: String)
     external fun discoverOnce(userAlias: String)
-    external fun startFileServer(saveDir: String)
+    private external fun startFileServer(saveDir: String)
     external fun sendFile(targetIp: String, filePath: String)
 }

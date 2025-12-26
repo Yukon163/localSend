@@ -50,6 +50,11 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.SettingsEthernet
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.filled.WifiTethering
+import android.os.Build
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
+import android.widget.Toast
 
 object TransferManager {
     // "正在发送...", "正在接收...", "完成"
@@ -82,18 +87,51 @@ object TransferManager {
 class MainActivity : ComponentActivity() {
     private var multicastLock: WifiManager.MulticastLock? = null
 
+    private val wifiStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (WifiManager.WIFI_STATE_CHANGED_ACTION == intent.action) {
+                val state = intent.getIntExtra(WifiManager.EXTRA_WIFI_STATE, WifiManager.WIFI_STATE_UNKNOWN)
+                if (state == WifiManager.WIFI_STATE_ENABLED) {
+                    Log.d("MainActivity", "WiFi 已开启，尝试重启服务")
+                    startLocalSendServices()
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val randomId = (1000..9999).random()
-        val localName = "Android-$randomId"
+        val filter = IntentFilter(WifiManager.WIFI_STATE_CHANGED_ACTION)
+        registerReceiver(wifiStateReceiver, filter)
+
+        startLocalSendServices()
+
+        enableEdgeToEdge()
+        setContent {
+            LocalSendTheme {
+                MainScreen()
+            }
+        }
+    }
+
+    private fun startLocalSendServices() {
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        if (!wifiManager.isWifiEnabled) {
+            Log.w("MainActivity", "WiFi 未开启，可能无法发现设备")
+            runOnUiThread {
+                Toast.makeText(this, "请开启 WiFi 以使用设备发现功能", Toast.LENGTH_LONG).show()
+            }
+        }
+
+        val localName = RustSDK.currentAlias ?: "Android-${(1000..9999).random()}"
         DeviceManager.myName = localName
 
         setupMulticastLock()
 
         try {
-            RustSDK.startDiscovery(localName)
-            Log.d("YukonTest", "Rust 发现服务启动成功")
+            RustSDK.startDiscoverySafe(localName)
+            Log.d("YukonTest", "Rust 发现服务启动 (Safe)")
         } catch (e: Exception) {
             Log.e("YukonTest", "Rust 发现服务启动失败 ${e.message}")
         }
@@ -112,21 +150,13 @@ class MainActivity : ComponentActivity() {
 
         val saveDir = myDir.absolutePath
         try {
-            RustSDK.startFileServer(saveDir)
-            Log.d("YukonTest", "Rust 文件接收服务启动成功，保存路径: $saveDir")
+            RustSDK.startFileServerSafe(saveDir)
+            Log.d("YukonTest", "Rust 文件接收服务启动 (Safe)，保存路径: $saveDir")
         } catch (e: Exception) {
             Log.e("YukonTest", "Rust 文件接收服务启动失败 ${e.message}")
         }
 
         RustSDK.discoverOnce(localName)
-
-//        RustSDK.testCallback()
-        enableEdgeToEdge()
-        setContent {
-            LocalSendTheme {
-                MainScreen()
-            }
-        }
     }
 
     private fun setupMulticastLock() {
@@ -139,10 +169,16 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        try {
+            unregisterReceiver(wifiStateReceiver)
+        } catch (e: Exception) {
+            Log.e("MainActivity", "注销广播接收器失败", e)
+        }
         multicastLock?.let {
             if (it.isHeld) it.release()
         }
     }
+
 }
 
 @Composable
@@ -222,7 +258,16 @@ fun DiscoveryScreen(
     val discoveredDevices = DeviceManager.devices
     val context = LocalContext.current
 
+    // 获取本机IP用于显示
+    var myIpList by remember { mutableStateOf<List<NetworkInfo>>(emptyList()) }
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            myIpList = NetworkUtils.getAllLocalIps()
+        }
+    }
+
     var pendingTargetIp by remember { mutableStateOf<String?>(null) }
+
 
     val fileLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -261,6 +306,22 @@ fun DiscoveryScreen(
             style = MaterialTheme.typography.titleMedium,
             modifier = Modifier.padding(bottom = 8.dp)
         )
+
+        if (myIpList.isNotEmpty()) {
+            Text(
+                text = "本机 IP: ${myIpList.joinToString { it.ip }}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
+        } else {
+            Text(
+                text = "未检测到有效网络 IP",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
+        }
 
         HorizontalDivider()
 

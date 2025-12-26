@@ -1,10 +1,13 @@
 package com.yukon.localsend
 
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
 
 object DeviceManager {
     val devices = mutableStateListOf<String>()
-    var myName: String = "Unknown"
+    var myName by mutableStateOf("Unknown")
 
     fun addDevice(info: String) {
         val parts = info.split("|")
