@@ -24,7 +24,7 @@
 
 1. 克隆本项目到本地
 2. 使用 Android Studio 打开
-3. 连接 Android 设备（需支持 arm64-v8a 架构）并运行
+3. 连接 Android 设备并运行
 
 ## 项目结构
 
