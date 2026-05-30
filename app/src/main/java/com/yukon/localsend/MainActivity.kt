@@ -158,6 +158,9 @@ object TransferManager {
         isTransferring.value = false
         progress.floatValue = if (success) 1.0f else 0f
         status.value = if (success) "传输成功" else "失败: $msg"
+        if (success && !isSending.value && msg.isNotBlank()) {
+            currentFileName.value = msg
+        }
         if (!isSending.value) {
             val dir = saveDir.value
             val originalName = collisionOriginalName.value
