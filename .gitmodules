@@ -1,0 +1,4 @@
+[submodule "locsd_lib"]
+	path = locsd_lib
+	url = https://github.com/Yukon163/locsd_lib.git
+	branch = feature/jni-to-localserver
