@@ -1,12 +1,13 @@
 import java.util.Properties
 
 plugins {
-    alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
-    alias(libs.plugins.kotlin.compose)
+    id("com.android.application")
+    id("kotlin-android")
+    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
+    id("dev.flutter.flutter-gradle-plugin")
 }
 
-val locsdLibDir = rootProject.layout.projectDirectory.dir("locsd_lib").asFile
+val locsdLibDir = rootProject.layout.projectDirectory.dir("../locsd_lib").asFile.absoluteFile
 val jniLibsDir = layout.projectDirectory.dir("src/main/jniLibs").asFile
 
 data class RustAndroidTarget(
@@ -57,25 +58,32 @@ fun clangExecutable(target: RustAndroidTarget): String {
         else -> "linux-x86_64"
     }
     val suffix = if (hostTag.startsWith("windows")) ".cmd" else ""
-    return File(androidNdkDir(), "toolchains/llvm/prebuilt/$hostTag/bin/${target.linkerName}$suffix").absolutePath
+    return File(
+        androidNdkDir(),
+        "toolchains/llvm/prebuilt/$hostTag/bin/${target.linkerName}$suffix",
+    ).absolutePath
 }
 
 android {
-    namespace = "com.yukon.localsend"
-    compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
-        }
+    namespace = "com.yukon.localsend.flutter"
+    compileSdk = flutter.compileSdkVersion
+    ndkVersion = flutter.ndkVersion
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17.toString()
     }
 
     defaultConfig {
-        applicationId = "com.yukon.localsend"
+        applicationId = "com.yukon.localsend.flutter"
         minSdk = 24
-        targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
-
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        targetSdk = flutter.targetSdkVersion
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -83,29 +91,15 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
+            // TODO: Add your own signing config for the release build.
+            // Signing with the debug keys for now, so `flutter run --release` works.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
-    buildFeatures {
-        compose = true
-    }
-
-
 }
 
-kotlin {
-    jvmToolchain(17)
-    compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
-    }
+flutter {
+    source = "../.."
 }
 
 val copyLocsdLibTasks = rustAndroidTargets.map { target ->
@@ -135,7 +129,7 @@ val copyLocsdLibTasks = rustAndroidTargets.map { target ->
 
     tasks.register<Copy>("copyLocsdLib$capitalizedAbi") {
         group = "build"
-        description = "Copy locsd_lib ${target.abi} shared library into app jniLibs."
+        description = "Copy locsd_lib ${target.abi} shared library into Flutter jniLibs."
         dependsOn(cargoBuildTask)
         from(locsdLibDir.resolve("target/${target.triple}/release/liblocalsend_core.so"))
         into(File(jniLibsDir, target.abi))
@@ -144,29 +138,13 @@ val copyLocsdLibTasks = rustAndroidTargets.map { target ->
 
 tasks.register("buildLocsdLibAndroid") {
     group = "build"
-    description = "Build locsd_lib Android shared libraries for all packaged ABIs."
+    description = "Build locsd_lib Android shared libraries for packaged ABIs."
     dependsOn(copyLocsdLibTasks)
 }
 
-tasks.matching { it.name.matches(Regex("merge.*JniLibFolders")) }.configureEach {
+tasks.matching {
+    it.name.matches(Regex("merge.*JniLibFolders")) ||
+        it.name.matches(Regex("merge.*NativeLibs"))
+}.configureEach {
     dependsOn("buildLocsdLibAndroid")
-}
-
-dependencies {
-    implementation(libs.androidx.material.icons.extended)
-    implementation(libs.androidx.core.ktx)
-    implementation(libs.androidx.lifecycle.runtime.ktx)
-    implementation(libs.androidx.activity.compose)
-    implementation(platform(libs.androidx.compose.bom))
-    implementation(libs.androidx.compose.ui)
-    implementation(libs.androidx.compose.ui.graphics)
-    implementation(libs.androidx.compose.ui.tooling.preview)
-    implementation(libs.androidx.compose.material3)
-    testImplementation(libs.junit)
-    androidTestImplementation(libs.androidx.junit)
-    androidTestImplementation(libs.androidx.espresso.core)
-    androidTestImplementation(platform(libs.androidx.compose.bom))
-    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
-    debugImplementation(libs.androidx.compose.ui.tooling)
-    debugImplementation(libs.androidx.compose.ui.test.manifest)
 }

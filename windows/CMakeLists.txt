@@ -49,7 +49,7 @@ endfunction()
 set(FLUTTER_MANAGED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flutter")
 add_subdirectory(${FLUTTER_MANAGED_DIR})
 
-set(LOCSD_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../locsd_lib")
+set(LOCSD_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../locsd_lib")
 set(LOCSD_LIB_DLL "${LOCSD_LIB_DIR}/target/release/localsend_core.dll")
 find_program(CARGO_EXECUTABLE cargo)
 if(NOT CARGO_EXECUTABLE)

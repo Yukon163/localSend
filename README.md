@@ -1,11 +1,9 @@
-# LocalSend
+# LocalSend Flutter
 
-局域网文件传输项目。当前仓库包含两个前端：
+局域网文件传输 Flutter 前端，传输核心来自 `locsd_lib/` Git submodule。
 
-- `app/`：原 Android Kotlin + Jetpack Compose 前端，通过 JNI 调用 Rust core。
-- `flutter_app/`：Flutter Android/Windows 前端，通过 Dart FFI 调用 Rust core。
-
-Rust 传输核心作为 Git submodule 放在 `locsd_lib/`。
+这个分支的仓库根目录就是 Flutter 工程，可以直接在根目录运行 Flutter 命令。
+旧的 Kotlin/Compose Android app 已从此分支移除。
 
 ## 克隆
 
@@ -19,15 +17,30 @@ git clone --recurse-submodules <repo-url>
 git submodule update --init --recursive
 ```
 
-## Flutter 前端
+## 运行
 
-准备 Flutter、Rust、Android SDK/NDK 后，在 `flutter_app/` 下构建。
+准备 Flutter、Rust、Android SDK/NDK 后：
 
 ```powershell
-cd flutter_app
+cd D:\code\localSend
 rustup target add aarch64-linux-android
 flutter pub get
+flutter run
 ```
+
+指定 Android 真机：
+
+```powershell
+flutter run -d 461QYGDP22FXS
+```
+
+指定 Windows 桌面：
+
+```powershell
+flutter run -d windows
+```
+
+## 构建
 
 Android debug 包：
 
@@ -41,21 +54,10 @@ Windows exe：
 flutter build windows
 ```
 
-Flutter Android 和 Windows 构建都会自动先编译 `../locsd_lib`，不需要手动先构建子仓。
+Android 和 Windows 构建都会自动先编译 `locsd_lib`，不需要手动先构建子仓。
 Android 目前只打包 `arm64-v8a`，不做 `armeabi-v7a` 适配。
 
-## 原 Android 前端
-
-用 Android Studio 打开主仓根目录并运行 `app`。Gradle 会在合并 JNI 库前自动构建
-`locsd_lib` 的 Android `liblocalsend_core.so`，同样只构建 `arm64-v8a`。
-
-也可以命令行构建：
-
-```powershell
-.\gradlew.bat :app:assembleDebug
-```
-
-## PC 旧版程序
+## 旧 PC 程序
 
 旧的 `localsend_app.exe` 来自 `locsd_lib` 的 Rust `bin` target：
 
