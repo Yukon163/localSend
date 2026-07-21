@@ -92,5 +92,6 @@ object RustSDK {
     external fun sendFile(targetIp: String, filePath: String): String
     external fun cancelTransfer(transferId: String): Boolean
     external fun retryTransfer(transferId: String): Boolean
+    external fun configureDeviceIdentity(deviceId: String, deviceName: String): Boolean
     external fun stopFileServer()
 }

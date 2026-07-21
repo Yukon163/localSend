@@ -413,6 +413,16 @@ internal fun tempNameForCollision(fileName: String): String {
 object AppSettings {
     private const val PREFS = "localsend_prefs"
     private const val KEY_SAVE_DIR = "save_dir"
+    private const val KEY_DEVICE_ID = "device_id"
+
+    fun getDeviceId(context: Context): String {
+        val prefs = context.getSharedPreferences(PREFS, MODE_PRIVATE)
+        val existing = prefs.getString(KEY_DEVICE_ID, null)
+        if (!existing.isNullOrBlank()) return existing
+        val generated = java.util.UUID.randomUUID().toString()
+        prefs.edit().putString(KEY_DEVICE_ID, generated).commit()
+        return generated
+    }
 
     fun getDefaultSaveDir(context: Context): String {
         val publicDownloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
@@ -477,6 +487,7 @@ class MainActivity : ComponentActivity() {
 
         val localName = RustSDK.currentAlias ?: "Android-${(1000..9999).random()}"
         DeviceManager.myName = localName
+        RustSDK.configureDeviceIdentity(AppSettings.getDeviceId(this), localName)
 
         setupMulticastLock()
 
