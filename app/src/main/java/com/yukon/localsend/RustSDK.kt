@@ -54,6 +54,13 @@ object RustSDK {
         }
     }
 
+    @JvmStatic
+    fun onTransferEvent(eventJson: String) {
+        runOnMain {
+            TransferManager.applyEvent(eventJson)
+        }
+    }
+
     var currentAlias: String? = null
         private set
 
@@ -82,5 +89,8 @@ object RustSDK {
     private external fun startDiscovery(userAlias: String)
     external fun discoverOnce(userAlias: String)
     private external fun startFileServer(saveDir: String)
-    external fun sendFile(targetIp: String, filePath: String)
+    external fun sendFile(targetIp: String, filePath: String): String
+    external fun cancelTransfer(transferId: String): Boolean
+    external fun retryTransfer(transferId: String): Boolean
+    external fun stopFileServer()
 }

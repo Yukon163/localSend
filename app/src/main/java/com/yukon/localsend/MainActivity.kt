@@ -65,8 +65,29 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.core.content.FileProvider
 import java.net.URLConnection
+import org.json.JSONObject
+import java.util.UUID
+
+data class TransferUiState(
+    val transferId: String,
+    val direction: String,
+    val state: String,
+    val fileName: String,
+    val durableBytes: Long,
+    val inFlightBytes: Long,
+    val totalBytes: Long,
+    val activeWorkers: Int,
+    val targetWorkers: Int,
+    val speedBytesPerSecond: Double,
+    val elapsedMs: Long,
+    val errorCode: String? = null,
+    val message: String? = null,
+)
 
 object TransferManager {
+    val transfers = mutableStateMapOf<String, TransferUiState>()
+    val activeTransferId = mutableStateOf<String?>(null)
+
     // "正在发送...", "正在接收...", "完成"
     val status = mutableStateOf("空闲")
     val currentFileName = mutableStateOf("")
@@ -87,6 +108,9 @@ object TransferManager {
     private val lastSpeedBytes = mutableStateOf<Long?>(null)
     private val collisionOriginalName = mutableStateOf<String?>(null)
     private val collisionTempPath = mutableStateOf<String?>(null)
+    private val outgoingCachePaths = mutableMapOf<String, String>()
+    private val outgoingTargets = mutableMapOf<String, String>()
+    private var appContext: Context? = null
 
     private fun formatBytesPerSec(bytesPerSec: Double): String {
         if (bytesPerSec <= 0) return "0 B/s"
@@ -147,6 +171,162 @@ object TransferManager {
         if (!isSending) {
             requestTab.intValue = 1
         }
+    }
+
+    fun registerOutgoingTransfer(context: Context, transferId: String, filePath: String, targetIp: String) {
+        appContext = context.applicationContext
+        activeTransferId.value = transferId
+        outgoingCachePaths[transferId] = filePath
+        outgoingTargets[transferId] = targetIp
+        val outgoingMeta = JSONObject()
+            .put("filePath", filePath)
+            .put("targetIp", targetIp)
+            .toString()
+        context.getSharedPreferences("localsend_outgoing", MODE_PRIVATE)
+            .edit().putString(transferId, outgoingMeta).apply()
+        val existing = transfers[transferId]
+        if (existing == null) {
+            transfers[transferId] = TransferUiState(
+                transferId = transferId,
+                direction = "send",
+                state = "hashing",
+                fileName = File(filePath).name,
+                durableBytes = 0,
+                inFlightBytes = 0,
+                totalBytes = File(filePath).length(),
+                activeWorkers = 0,
+                targetWorkers = 8,
+                speedBytesPerSecond = 0.0,
+                elapsedMs = 0,
+            )
+        }
+    }
+
+    fun restoreOutgoingTransfers(context: Context) {
+        appContext = context.applicationContext
+        val records = context.getSharedPreferences("localsend_outgoing", MODE_PRIVATE).all
+        records.forEach { (transferId, encoded) ->
+            val meta = runCatching { JSONObject(encoded as String) }.getOrNull() ?: return@forEach
+            val filePath = meta.optString("filePath")
+            val targetIp = meta.optString("targetIp")
+            val file = File(filePath)
+            if (!file.exists() || targetIp.isBlank()) return@forEach
+            outgoingCachePaths[transferId] = filePath
+            outgoingTargets[transferId] = targetIp
+            transfers[transferId] = TransferUiState(
+                transferId = transferId,
+                direction = "send",
+                state = "failed",
+                fileName = file.name,
+                durableBytes = 0,
+                inFlightBytes = 0,
+                totalBytes = file.length(),
+                activeWorkers = 0,
+                targetWorkers = 0,
+                speedBytesPerSecond = 0.0,
+                elapsedMs = 0,
+                errorCode = "process_restarted",
+                message = "发送进程已重启，可从接收端 durable 进度继续",
+            )
+        }
+    }
+
+    fun applyEvent(eventJson: String) {
+        val event = try {
+            JSONObject(eventJson)
+        } catch (error: Exception) {
+            Log.e("TransferManager", "Invalid transfer event", error)
+            return
+        }
+        val transferId = event.optString("transferId")
+        if (transferId.isBlank()) return
+        val direction = event.optString("direction", "send")
+        val state = event.optString("state", "transferring")
+        val fileName = event.optString("fileName")
+        val durable = event.optLong("durableBytes")
+        val inFlight = event.optLong("inFlightBytes")
+        val total = event.optLong("totalBytes")
+        val speed = event.optDouble("speedBytesPerSecond", 0.0)
+        val message = event.optString("message").takeIf { it.isNotBlank() && it != "null" }
+        val errorCode = event.optString("errorCode").takeIf { it.isNotBlank() && it != "null" }
+        val updated = TransferUiState(
+            transferId = transferId,
+            direction = direction,
+            state = state,
+            fileName = fileName,
+            durableBytes = durable,
+            inFlightBytes = inFlight,
+            totalBytes = total,
+            activeWorkers = event.optInt("activeWorkers"),
+            targetWorkers = event.optInt("targetWorkers"),
+            speedBytesPerSecond = speed,
+            elapsedMs = event.optLong("elapsedMs"),
+            errorCode = errorCode,
+            message = message,
+        )
+        transfers[transferId] = updated
+        activeTransferId.value = transferId
+
+        currentFileName.value = fileName
+        isTransferring.value = state !in setOf("completed", "failed", "cancelled")
+        status.value = when (state) {
+            "hashing" -> "正在校验文件..."
+            "negotiating" -> "正在协商 V3..."
+            "transferring" -> if (direction == "send") "正在发送..." else "正在接收..."
+            "paused" -> "正在安全拆分..."
+            "verifying" -> "正在校验完整文件..."
+            "completed" -> "传输成功"
+            "cancelled" -> "传输已取消"
+            "failed" -> "失败: ${message ?: errorCode ?: "未知错误"}"
+            else -> state
+        }
+        if (total > 0) progress.floatValue = (durable.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+        speedText.value = formatBytesPerSec(speed)
+        if (state == "completed" || state == "cancelled") {
+            cleanupOutgoingCache(transferId)
+        }
+        if (state == "completed" && direction == "receive" && message != null) {
+            currentFileName.value = message
+            val dir = saveDir.value
+            if (dir.isNotBlank()) {
+                lastReceivedDirPath.value = dir
+                lastReceivedFilePath.value = File(dir, message).absolutePath
+            }
+        }
+    }
+
+    fun cancel(transferId: String): Boolean = RustSDK.cancelTransfer(transferId)
+
+    fun retry(transferId: String): Boolean {
+        if (RustSDK.retryTransfer(transferId)) return true
+        val context = appContext ?: return false
+        val filePath = outgoingCachePaths[transferId] ?: return false
+        val targetIp = outgoingTargets[transferId] ?: return false
+        if (!File(filePath).exists()) return false
+        val newTransferId = RustSDK.sendFile(targetIp, filePath)
+        context.getSharedPreferences("localsend_outgoing", MODE_PRIVATE).edit().remove(transferId).apply()
+        outgoingCachePaths.remove(transferId)
+        outgoingTargets.remove(transferId)
+        registerOutgoingTransfer(context, newTransferId, filePath, targetIp)
+        return true
+    }
+
+    private fun cleanupOutgoingCache(transferId: String) {
+        val context = appContext ?: return
+        val preferences = context.getSharedPreferences("localsend_outgoing", MODE_PRIVATE)
+        val encoded = preferences.getString(transferId, null)
+        val persistedPath = runCatching { JSONObject(encoded ?: "").optString("filePath") }.getOrNull()
+        val path = outgoingCachePaths.remove(transferId) ?: persistedPath
+        outgoingTargets.remove(transferId)
+        if (path != null) {
+            val file = File(path)
+            val outgoingRoot = File(context.cacheDir, "outgoing").canonicalFile
+            if (file.canonicalFile.path.startsWith(outgoingRoot.path + File.separator)) {
+                file.delete()
+                file.parentFile?.delete()
+            }
+        }
+        preferences.edit().remove(transferId).apply()
     }
 
     fun markIncomingNameCollision(originalName: String, tempPath: String) {
@@ -271,6 +451,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        TransferManager.restoreOutgoingTransfers(this)
 
         val filter = IntentFilter(WifiManager.WIFI_STATE_CHANGED_ACTION)
         registerReceiver(wifiStateReceiver, filter)
@@ -473,9 +654,10 @@ fun DiscoveryScreen(
                         TransferManager.currentFileName.value = File(realPath).name
                         Log.d("YukonSend", "开始发送文件: $realPath -> $targetIp")
                         // 3. 调用 Rust 发送
-                        withContext(Dispatchers.IO) {
+                        val transferId = withContext(Dispatchers.IO) {
                             RustSDK.sendFile(targetIp, realPath)
                         }
+                        TransferManager.registerOutgoingTransfer(context, transferId, realPath, targetIp)
                     } else {
                         TransferManager.finishTransfer(false, "文件解析失败")
                     }
@@ -574,6 +756,7 @@ fun ReceiveScreen() {
     val context = LocalContext.current
     val receivedPath by TransferManager.lastReceivedFilePath
     val receivedDir by TransferManager.lastReceivedDirPath
+    val transferStates = TransferManager.transfers.values.toList()
 
     var ipList by remember { mutableStateOf<List<NetworkInfo>>(emptyList()) }
 
@@ -657,6 +840,36 @@ fun ReceiveScreen() {
         if (isTransferring && speed.isNotBlank()) {
             Spacer(modifier = Modifier.height(8.dp))
             Text(text = "速度: $speed", style = MaterialTheme.typography.bodyMedium)
+        }
+
+        if (transferStates.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(16.dp))
+            transferStates.takeLast(4).forEach { transfer ->
+                Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text(transfer.fileName, style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            "${transfer.direction} · ${transfer.state} · worker ${transfer.activeWorkers}/${transfer.targetWorkers}",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        val durableProgress = if (transfer.totalBytes > 0) {
+                            transfer.durableBytes.toFloat() / transfer.totalBytes.toFloat()
+                        } else if (transfer.state == "completed") 1f else 0f
+                        LinearProgressIndicator(
+                            progress = { durableProgress.coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (transfer.state !in setOf("completed", "failed", "cancelled")) {
+                                TextButton(onClick = { TransferManager.cancel(transfer.transferId) }) { Text("取消") }
+                            }
+                            if (transfer.state == "failed") {
+                                TextButton(onClick = { TransferManager.retry(transfer.transferId) }) { Text("重试") }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if (!isTransferring && status == "传输成功" && (receivedPath != null || receivedDir != null)) {
@@ -862,11 +1075,13 @@ fun copyUriToCache(context: Context, uri: Uri): String? {
         contentResolver.query(uri, null, null, null, null)?.use { cursor ->
             if (cursor.moveToFirst()) {
                 val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (index != -1) fileName = cursor.getString(index)
+                if (index != -1) fileName = File(cursor.getString(index)).name
             }
         }
 
-        val cacheFile = File(context.cacheDir, fileName)
+        val outgoingDir = File(context.cacheDir, "outgoing/${UUID.randomUUID()}")
+        if (!outgoingDir.mkdirs() && !outgoingDir.isDirectory) return null
+        val cacheFile = File(outgoingDir, fileName)
 
         contentResolver.openInputStream(uri)?.use { input ->
             FileOutputStream(cacheFile).use { output ->

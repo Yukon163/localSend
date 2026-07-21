@@ -60,6 +60,17 @@ fun clangExecutable(target: RustAndroidTarget): String {
     return File(androidNdkDir(), "toolchains/llvm/prebuilt/$hostTag/bin/${target.linkerName}$suffix").absolutePath
 }
 
+fun llvmArExecutable(): String {
+    val osName = System.getProperty("os.name")
+    val hostTag = when {
+        osName.contains("Windows", ignoreCase = true) -> "windows-x86_64"
+        osName.contains("Mac", ignoreCase = true) -> "darwin-x86_64"
+        else -> "linux-x86_64"
+    }
+    val suffix = if (hostTag.startsWith("windows")) ".exe" else ""
+    return File(androidNdkDir(), "toolchains/llvm/prebuilt/$hostTag/bin/llvm-ar$suffix").absolutePath
+}
+
 android {
     namespace = "com.yukon.localsend"
     compileSdk {
@@ -127,6 +138,8 @@ val copyLocsdLibTasks = rustAndroidTargets.map { target ->
             "--lib",
         )
         environment(target.linkerEnv, clangExecutable(target))
+        environment("CC_${target.triple.replace('-', '_')}", clangExecutable(target))
+        environment("AR_${target.triple.replace('-', '_')}", llvmArExecutable())
         inputs.files(fileTree(locsdLibDir.resolve("src")))
         inputs.file(locsdLibDir.resolve("Cargo.toml"))
         inputs.file(locsdLibDir.resolve("Cargo.lock"))
