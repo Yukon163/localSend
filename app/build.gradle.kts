@@ -93,6 +93,10 @@ android {
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".codex"
+            versionNameSuffix = "-codex-pipeline"
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(

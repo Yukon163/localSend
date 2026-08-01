@@ -1,8 +1,13 @@
 package com.yukon.localsend
 
 import android.content.Context
+import android.content.ContentValues
+import android.content.ContentUris
 import android.net.Uri
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -19,6 +24,7 @@ import android.net.wifi.WifiManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -38,12 +44,18 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import android.provider.OpenableColumns
-import androidx.compose.material.icons.filled.Info
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.text.font.FontWeight
 import java.io.FileOutputStream
 import androidx.compose.material.icons.filled.Info
@@ -55,11 +67,10 @@ import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
 import android.widget.Toast
-import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Context.MODE_PRIVATE
 import android.os.Environment
-import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.webkit.MimeTypeMap
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -67,6 +78,26 @@ import androidx.core.content.FileProvider
 import java.net.URLConnection
 import org.json.JSONObject
 import java.util.UUID
+
+data class TransferSegmentUi(
+    val start: Long,
+    val end: Long,
+    val downloadedEnd: Long,
+    val running: Boolean,
+)
+
+data class TransferDiagnosticsUi(
+    val hashingMs: Long = 0,
+    val negotiatingMs: Long = 0,
+    val transferringMs: Long = 0,
+    val verifyingMs: Long = 0,
+    val wireBytes: Long = 0,
+    val retransmittedBytes: Long = 0,
+    val splitTrials: Int = 0,
+    val rollbacks: Int = 0,
+    val retries: Int = 0,
+    val timeoutsOrResets: Int = 0,
+)
 
 data class TransferUiState(
     val transferId: String,
@@ -77,12 +108,308 @@ data class TransferUiState(
     val inFlightBytes: Long,
     val totalBytes: Long,
     val activeWorkers: Int,
+    val allocatedWorkers: Int = 0,
     val targetWorkers: Int,
     val speedBytesPerSecond: Double,
     val elapsedMs: Long,
+    val stageBytes: Long = 0,
+    val stageTotalBytes: Long = 0,
     val errorCode: String? = null,
     val message: String? = null,
+    val segments: List<TransferSegmentUi> = emptyList(),
+    val updatedAtMs: Long = System.currentTimeMillis(),
+    val diagnostics: TransferDiagnosticsUi = TransferDiagnosticsUi(),
 )
+
+internal fun recentTransferStates(
+    transfers: Collection<TransferUiState>,
+    limit: Int = 4,
+): List<TransferUiState> = transfers
+    .sortedByDescending(TransferUiState::updatedAtMs)
+    .take(limit.coerceAtLeast(0))
+
+internal fun isStrictFileDescendant(root: File, candidate: File): Boolean = runCatching {
+    val canonicalRoot = root.canonicalFile
+    val canonicalCandidate = candidate.canonicalFile
+    canonicalCandidate.path.startsWith(canonicalRoot.path + File.separator)
+}.getOrDefault(false)
+
+internal fun saturatingAddBytes(left: Long, right: Long): Long {
+    val safeLeft = left.coerceAtLeast(0L)
+    val safeRight = right.coerceAtLeast(0L)
+    return if (Long.MAX_VALUE - safeLeft < safeRight) Long.MAX_VALUE else safeLeft + safeRight
+}
+
+internal fun parseTransferSegments(event: JSONObject, totalBytes: Long): List<TransferSegmentUi> {
+    if (totalBytes <= 0L) return emptyList()
+    val encoded = event.optJSONArray("segments") ?: return emptyList()
+    val decoded = buildList {
+        for (index in 0 until encoded.length()) {
+            val segment = encoded.optJSONObject(index) ?: continue
+            add(
+                TransferSegmentUi(
+                    start = segment.optLong("start", -1L),
+                    end = segment.optLong("end", -1L),
+                    downloadedEnd = segment.optLong("downloadedEnd", -1L),
+                    running = segment.optBoolean("running", false),
+                )
+            )
+        }
+    }
+    return normalizeTransferSegments(decoded, totalBytes)
+}
+
+internal fun normalizeTransferSegments(
+    segments: List<TransferSegmentUi>,
+    totalBytes: Long,
+): List<TransferSegmentUi> {
+    if (totalBytes <= 0L) return emptyList()
+    return segments.mapNotNull { segment ->
+        if (segment.start < 0L || segment.start >= totalBytes || segment.end <= segment.start) {
+            return@mapNotNull null
+        }
+        val boundedEnd = segment.end.coerceAtMost(totalBytes)
+        segment.copy(
+            end = boundedEnd,
+            downloadedEnd = segment.downloadedEnd.coerceIn(segment.start, boundedEnd),
+        )
+    }.sortedWith(compareBy(TransferSegmentUi::start, TransferSegmentUi::end))
+}
+
+private const val PUBLIC_DOWNLOAD_SUBDIRECTORY = "localsend_yukon"
+private const val PUBLICATION_PREFS = "localsend_publications"
+private const val PUBLICATION_STATE_PREPARING = "preparing"
+private const val PUBLICATION_STATE_COPYING = "copying"
+private const val PUBLICATION_STATE_PUBLISHED = "published"
+
+private sealed interface PublishResult {
+    data class Published(
+        val uri: Uri,
+        val displayName: String,
+    ) : PublishResult
+
+    data class Retained(val reason: String) : PublishResult
+}
+
+private data class PublicationReceipt(
+    val state: String,
+    val uri: Uri?,
+    val sourceSize: Long,
+    val sourceLastModified: Long,
+)
+
+private fun publicationKey(stagingFile: File): String =
+    runCatching { stagingFile.canonicalPath }.getOrElse { stagingFile.absolutePath }
+
+private fun readPublicationReceipt(context: Context, stagingFile: File): PublicationReceipt? {
+    val encoded = context.getSharedPreferences(PUBLICATION_PREFS, MODE_PRIVATE)
+        .getString(publicationKey(stagingFile), null)
+        ?: return null
+    return runCatching {
+        val json = JSONObject(encoded)
+        PublicationReceipt(
+            state = json.getString("state"),
+            uri = json.optString("uri").takeIf(String::isNotBlank)?.let(Uri::parse),
+            sourceSize = json.getLong("sourceSize"),
+            sourceLastModified = json.getLong("sourceLastModified"),
+        )
+    }.getOrNull()
+}
+
+private fun writePublicationReceipt(
+    context: Context,
+    stagingFile: File,
+    state: String,
+    uri: Uri?,
+): Boolean {
+    val encoded = JSONObject()
+        .put("state", state)
+        .put("uri", uri?.toString() ?: "")
+        .put("sourceSize", stagingFile.length())
+        .put("sourceLastModified", stagingFile.lastModified())
+        .toString()
+    return context.getSharedPreferences(PUBLICATION_PREFS, MODE_PRIVATE)
+        .edit()
+        .putString(publicationKey(stagingFile), encoded)
+        .commit()
+}
+
+private fun clearPublicationReceipt(context: Context, stagingFile: File) {
+    context.getSharedPreferences(PUBLICATION_PREFS, MODE_PRIVATE)
+        .edit()
+        .remove(publicationKey(stagingFile))
+        .commit()
+}
+
+private fun publishedUri(context: Context, stagingFile: File): Uri? {
+    val receipt = readPublicationReceipt(context, stagingFile) ?: return null
+    if (receipt.state != PUBLICATION_STATE_PUBLISHED
+        || receipt.sourceSize != stagingFile.length()
+        || receipt.sourceLastModified != stagingFile.lastModified()
+    ) {
+        clearPublicationReceipt(context, stagingFile)
+        return null
+    }
+    val uri = receipt.uri ?: return null
+    val readable = runCatching {
+        context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { true } ?: false
+    }.getOrDefault(false)
+    if (!readable) {
+        clearPublicationReceipt(context, stagingFile)
+        return null
+    }
+    return uri
+}
+
+internal fun resolveCompletedStagingFile(stagingDir: File, completedName: String): File? {
+    val safeName = File(completedName).name.takeIf { it.isNotBlank() && it != "." && it != ".." }
+        ?: return null
+    val root = runCatching { stagingDir.canonicalFile }.getOrNull() ?: return null
+    val candidate = runCatching { File(root, safeName).canonicalFile }.getOrNull() ?: return null
+    return candidate.takeIf { it.parentFile == root }
+}
+
+private fun mimeTypeForName(fileName: String): String {
+    val extension = File(fileName).extension.lowercase()
+    return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
+        ?: URLConnection.guessContentTypeFromName(fileName)
+        ?: "application/octet-stream"
+}
+
+private fun publishStagingFile(context: Context, stagingFile: File): PublishResult {
+    if (!stagingFile.isFile) {
+        return PublishResult.Retained("暂存文件不存在，无法导出")
+    }
+    publishedUri(context, stagingFile)?.let { uri ->
+        return PublishResult.Published(uri = uri, displayName = stagingFile.name)
+    }
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+        return PublishResult.Retained("Android 10 以下暂不自动导出，文件仍安全保存在应用暂存目录")
+    }
+
+    if (!writePublicationReceipt(
+            context,
+            stagingFile,
+            PUBLICATION_STATE_PREPARING,
+            null,
+        )
+    ) {
+        return PublishResult.Retained("无法持久化导出任务，已保留暂存文件")
+    }
+
+    val resolver = context.contentResolver
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, stagingFile.name)
+        put(MediaStore.MediaColumns.MIME_TYPE, mimeTypeForName(stagingFile.name))
+        put(
+            MediaStore.MediaColumns.RELATIVE_PATH,
+            "${Environment.DIRECTORY_DOWNLOADS}/$PUBLIC_DOWNLOAD_SUBDIRECTORY",
+        )
+        put(MediaStore.MediaColumns.IS_PENDING, 1)
+    }
+    val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+    val uri = try {
+        resolver.insert(collection, values)
+            ?: run {
+                clearPublicationReceipt(context, stagingFile)
+                return PublishResult.Retained("系统下载目录拒绝创建文件，已保留暂存文件")
+            }
+    } catch (error: Exception) {
+        Log.e("TransferManager", "Unable to create MediaStore download", error)
+        clearPublicationReceipt(context, stagingFile)
+        return PublishResult.Retained("无法访问系统下载目录，已保留暂存文件")
+    }
+
+    return try {
+        if (!writePublicationReceipt(
+                context,
+                stagingFile,
+                PUBLICATION_STATE_COPYING,
+                uri,
+            )
+        ) {
+            error("Unable to persist pending MediaStore URI")
+        }
+        val descriptor = resolver.openFileDescriptor(uri, "w")
+            ?: error("MediaStore returned no file descriptor")
+        stagingFile.inputStream().use { input ->
+            ParcelFileDescriptor.AutoCloseOutputStream(descriptor).use { output ->
+                input.copyTo(output)
+                output.flush()
+                output.fd.sync()
+            }
+        }
+
+        val ready = ContentValues().apply {
+            put(MediaStore.MediaColumns.IS_PENDING, 0)
+        }
+        if (resolver.update(uri, ready, null, null) <= 0) {
+            error("MediaStore failed to finalize pending download")
+        }
+        if (!writePublicationReceipt(
+                context,
+                stagingFile,
+                PUBLICATION_STATE_PUBLISHED,
+                uri,
+            )
+        ) {
+            error("Unable to persist completed MediaStore URI")
+        }
+
+        PublishResult.Published(
+            uri = uri,
+            displayName = stagingFile.name,
+        )
+    } catch (error: Exception) {
+        Log.e("TransferManager", "Unable to publish received file", error)
+        runCatching { resolver.delete(uri, null, null) }
+        clearPublicationReceipt(context, stagingFile)
+        PublishResult.Retained("导出到系统下载目录失败，已保留暂存文件")
+    }
+}
+
+private fun reconcileInterruptedPublicationRecords(context: Context) {
+    val preferences = context.getSharedPreferences(PUBLICATION_PREFS, MODE_PRIVATE)
+    val editor = preferences.edit()
+    preferences.all.forEach { (sourcePath, encoded) ->
+        val json = runCatching { JSONObject(encoded as String) }.getOrNull()
+        val state = json?.optString("state")
+        if (state == PUBLICATION_STATE_PREPARING || state == PUBLICATION_STATE_COPYING) {
+            json.optString("uri").takeIf(String::isNotBlank)?.let(Uri::parse)?.let { uri ->
+                runCatching { context.contentResolver.delete(uri, null, null) }
+            }
+            editor.remove(sourcePath)
+        }
+    }
+    editor.commit()
+}
+
+private fun removeOrphanedPendingDownloads(context: Context) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+    val resolver = context.contentResolver
+    val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+    val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/$PUBLIC_DOWNLOAD_SUBDIRECTORY/"
+    runCatching {
+        resolver.query(
+            collection,
+            arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.OWNER_PACKAGE_NAME),
+            "${MediaStore.MediaColumns.IS_PENDING}=1 AND ${MediaStore.MediaColumns.RELATIVE_PATH}=?",
+            arrayOf(relativePath),
+            null,
+        )?.use { cursor ->
+            val idColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+            val ownerColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.OWNER_PACKAGE_NAME)
+            while (cursor.moveToNext()) {
+                if (cursor.getString(ownerColumn) == context.packageName) {
+                    val uri = ContentUris.withAppendedId(collection, cursor.getLong(idColumn))
+                    runCatching { resolver.delete(uri, null, null) }
+                }
+            }
+        }
+    }.onFailure { error ->
+        Log.w("TransferManager", "Unable to reconcile pending MediaStore rows", error)
+    }
+}
 
 object TransferManager {
     val transfers = mutableStateMapOf<String, TransferUiState>()
@@ -110,7 +437,16 @@ object TransferManager {
     private val collisionTempPath = mutableStateOf<String?>(null)
     private val outgoingCachePaths = mutableMapOf<String, String>()
     private val outgoingTargets = mutableMapOf<String, String>()
+    private val outgoingUris = mutableMapOf<String, String>()
+    private val outgoingFileNames = mutableMapOf<String, String>()
+    private val outgoingFileSizes = mutableMapOf<String, Long>()
+    private val publicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val publicationMutex = Mutex()
+    private val publicationLock = Any()
+    private val publishingPaths = mutableSetOf<String>()
     private var appContext: Context? = null
+    private var initializedStagingRoot: String? = null
 
     private fun formatBytesPerSec(bytesPerSec: Double): String {
         if (bytesPerSec <= 0) return "0 B/s"
@@ -173,7 +509,27 @@ object TransferManager {
         }
     }
 
-    fun registerOutgoingTransfer(context: Context, transferId: String, filePath: String, targetIp: String) {
+    fun updatePreparation(filename: String, stage: String, processed: Long, total: Long) {
+        isTransferring.value = true
+        isSending.value = true
+        currentFileName.value = filename
+        status.value = stage
+        totalBytes.value = total.takeIf { it > 0L }
+        transferredBytes.value = processed
+        progress.floatValue = if (total > 0L) {
+            (processed.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+    }
+
+    fun registerOutgoingTransfer(
+        context: Context,
+        transferId: String,
+        filePath: String,
+        targetIp: String,
+        replacesTransferId: String? = null,
+    ) {
         appContext = context.applicationContext
         activeTransferId.value = transferId
         outgoingCachePaths[transferId] = filePath
@@ -183,7 +539,14 @@ object TransferManager {
             .put("targetIp", targetIp)
             .toString()
         context.getSharedPreferences("localsend_outgoing", MODE_PRIVATE)
-            .edit().putString(transferId, outgoingMeta).apply()
+            .edit()
+            .putString(transferId, outgoingMeta)
+            .also { editor ->
+                if (replacesTransferId != null && replacesTransferId != transferId) {
+                    editor.remove(replacesTransferId)
+                }
+            }
+            .apply()
         val existing = transfers[transferId]
         if (existing == null) {
             transfers[transferId] = TransferUiState(
@@ -200,6 +563,67 @@ object TransferManager {
                 elapsedMs = 0,
             )
         }
+        if (replacesTransferId != null && replacesTransferId != transferId) {
+            transfers.remove(replacesTransferId)
+            outgoingCachePaths.remove(replacesTransferId)
+            outgoingTargets.remove(replacesTransferId)
+        }
+    }
+
+    fun registerOutgoingUriTransfer(
+        context: Context,
+        transferId: String,
+        uri: Uri,
+        fileName: String,
+        fileSize: Long,
+        targetIp: String,
+        replacesTransferId: String? = null,
+    ) {
+        appContext = context.applicationContext
+        activeTransferId.value = transferId
+        outgoingUris[transferId] = uri.toString()
+        outgoingFileNames[transferId] = fileName
+        outgoingFileSizes[transferId] = fileSize
+        outgoingTargets[transferId] = targetIp
+        val outgoingMeta = JSONObject()
+            .put("uri", uri.toString())
+            .put("fileName", fileName)
+            .put("fileSize", fileSize)
+            .put("targetIp", targetIp)
+            .toString()
+        context.getSharedPreferences("localsend_outgoing", MODE_PRIVATE)
+            .edit()
+            .putString(transferId, outgoingMeta)
+            .also { editor ->
+                if (replacesTransferId != null && replacesTransferId != transferId) {
+                    editor.remove(replacesTransferId)
+                }
+            }
+            .apply()
+        transfers.putIfAbsent(
+            transferId,
+            TransferUiState(
+                transferId = transferId,
+                direction = "send",
+                state = "hashing",
+                fileName = fileName,
+                durableBytes = 0,
+                inFlightBytes = 0,
+                totalBytes = fileSize,
+                activeWorkers = 0,
+                targetWorkers = 8,
+                speedBytesPerSecond = 0.0,
+                elapsedMs = 0,
+            ),
+        )
+        if (replacesTransferId != null && replacesTransferId != transferId) {
+            transfers.remove(replacesTransferId)
+            outgoingCachePaths.remove(replacesTransferId)
+            outgoingTargets.remove(replacesTransferId)
+            outgoingUris.remove(replacesTransferId)
+            outgoingFileNames.remove(replacesTransferId)
+            outgoingFileSizes.remove(replacesTransferId)
+        }
     }
 
     fun restoreOutgoingTransfers(context: Context) {
@@ -208,19 +632,28 @@ object TransferManager {
         records.forEach { (transferId, encoded) ->
             val meta = runCatching { JSONObject(encoded as String) }.getOrNull() ?: return@forEach
             val filePath = meta.optString("filePath")
+            val uri = meta.optString("uri")
+            val fileName = meta.optString("fileName")
+            val fileSize = meta.optLong("fileSize", -1L)
             val targetIp = meta.optString("targetIp")
             val file = File(filePath)
-            if (!file.exists() || targetIp.isBlank()) return@forEach
-            outgoingCachePaths[transferId] = filePath
+            if (targetIp.isBlank() || (uri.isBlank() && !file.exists())) return@forEach
+            if (uri.isNotBlank()) {
+                outgoingUris[transferId] = uri
+                outgoingFileNames[transferId] = fileName
+                outgoingFileSizes[transferId] = fileSize
+            } else {
+                outgoingCachePaths[transferId] = filePath
+            }
             outgoingTargets[transferId] = targetIp
             transfers[transferId] = TransferUiState(
                 transferId = transferId,
                 direction = "send",
                 state = "failed",
-                fileName = file.name,
+                fileName = if (uri.isNotBlank()) fileName else file.name,
                 durableBytes = 0,
                 inFlightBytes = 0,
-                totalBytes = file.length(),
+                totalBytes = if (uri.isNotBlank()) fileSize.coerceAtLeast(0L) else file.length(),
                 activeWorkers = 0,
                 targetWorkers = 0,
                 speedBytesPerSecond = 0.0,
@@ -228,6 +661,105 @@ object TransferManager {
                 errorCode = "process_restarted",
                 message = "发送进程已重启，可从接收端 durable 进度继续",
             )
+        }
+    }
+
+    fun initializeIncomingStorage(context: Context, stagingDir: File) {
+        val applicationContext = context.applicationContext
+        val canonicalRoot = runCatching { stagingDir.canonicalPath }
+            .getOrElse { stagingDir.absolutePath }
+        appContext = applicationContext
+        saveDir.value = canonicalRoot
+        val shouldRecover = synchronized(publicationLock) {
+            if (initializedStagingRoot == canonicalRoot) {
+                false
+            } else {
+                initializedStagingRoot = canonicalRoot
+                true
+            }
+        }
+        if (!shouldRecover) return
+
+        publicationScope.launch {
+            publicationMutex.withLock {
+                reconcileInterruptedPublicationRecords(applicationContext)
+                removeOrphanedPendingDownloads(applicationContext)
+            }
+            val completedFiles = File(canonicalRoot).listFiles()
+                ?.filter(File::isFile)
+                .orEmpty()
+            withContext(Dispatchers.Main.immediate) {
+                completedFiles.forEach { file ->
+                    publishCompletedIncoming("recovery:${publicationKey(file)}", file.name)
+                }
+            }
+        }
+    }
+
+    private fun shouldProjectPublication(completionKey: String): Boolean {
+        return activeTransferId.value == completionKey
+            || (completionKey.startsWith("legacy:") && !isTransferring.value)
+    }
+
+    private fun publishCompletedIncoming(completionKey: String, completedName: String) {
+        val context = appContext
+        val stagingRoot = saveDir.value.takeIf { it.isNotBlank() }?.let(::File)
+        if (context == null || stagingRoot == null) {
+            if (shouldProjectPublication(completionKey)) {
+                noticeText.value = "接收已完成，但应用暂存目录尚未初始化"
+            }
+            return
+        }
+        val stagingFile = resolveCompletedStagingFile(stagingRoot, completedName)
+        if (stagingFile == null || !stagingFile.isFile) {
+            if (shouldProjectPublication(completionKey)) {
+                noticeText.value = "接收已完成，但找不到可导出的暂存文件"
+                lastReceivedFilePath.value = null
+                lastReceivedDirPath.value = stagingRoot.absolutePath
+            }
+            return
+        }
+
+        val pathKey = publicationKey(stagingFile)
+        val started = synchronized(publicationLock) { publishingPaths.add(pathKey) }
+        if (!started) return
+
+        if (shouldProjectPublication(completionKey)) {
+            currentFileName.value = stagingFile.name
+            lastReceivedFilePath.value = stagingFile.absolutePath
+            lastReceivedDirPath.value = stagingRoot.absolutePath
+            status.value = "正在保存到下载目录..."
+            noticeText.value = "文件已接收，正在导出到 Downloads/$PUBLIC_DOWNLOAD_SUBDIRECTORY"
+        }
+
+        publicationScope.launch {
+            try {
+                val result = publicationMutex.withLock {
+                    publishStagingFile(context, stagingFile)
+                }
+                withContext(Dispatchers.Main.immediate) {
+                    if (shouldProjectPublication(completionKey)) {
+                        status.value = "传输成功"
+                        when (result) {
+                            is PublishResult.Published -> {
+                                currentFileName.value = result.displayName
+                                lastReceivedFilePath.value = result.uri.toString()
+                                lastReceivedDirPath.value = null
+                                noticeText.value =
+                                    "已保存到 Downloads/$PUBLIC_DOWNLOAD_SUBDIRECTORY；暂存副本为断点恢复保留"
+                            }
+
+                            is PublishResult.Retained -> {
+                                lastReceivedFilePath.value = stagingFile.absolutePath
+                                lastReceivedDirPath.value = stagingRoot.absolutePath
+                                noticeText.value = result.reason
+                            }
+                        }
+                    }
+                }
+            } finally {
+                synchronized(publicationLock) { publishingPaths.remove(pathKey) }
+            }
         }
     }
 
@@ -246,9 +778,32 @@ object TransferManager {
         val durable = event.optLong("durableBytes")
         val inFlight = event.optLong("inFlightBytes")
         val total = event.optLong("totalBytes")
+        val stageBytes = event.optLong("stageBytes")
+        val stageTotalBytes = event.optLong("stageTotalBytes")
         val speed = event.optDouble("speedBytesPerSecond", 0.0)
         val message = event.optString("message").takeIf { it.isNotBlank() && it != "null" }
         val errorCode = event.optString("errorCode").takeIf { it.isNotBlank() && it != "null" }
+        val diagnosticJson = event.optJSONObject("diagnostics")
+        val diagnostics = TransferDiagnosticsUi(
+            hashingMs = diagnosticJson?.optLong("hashingMs") ?: 0L,
+            negotiatingMs = diagnosticJson?.optLong("negotiatingMs") ?: 0L,
+            transferringMs = diagnosticJson?.optLong("transferringMs") ?: 0L,
+            verifyingMs = diagnosticJson?.optLong("verifyingMs") ?: 0L,
+            wireBytes = diagnosticJson?.optLong("wireBytes") ?: 0L,
+            retransmittedBytes = diagnosticJson?.optLong("retransmittedBytes") ?: 0L,
+            splitTrials = diagnosticJson?.optInt("splitTrials") ?: 0,
+            rollbacks = diagnosticJson?.optInt("rollbacks") ?: 0,
+            retries = diagnosticJson?.optInt("retries") ?: 0,
+            timeoutsOrResets = diagnosticJson?.optInt("timeoutsOrResets") ?: 0,
+        )
+        val parsedSegments = parseTransferSegments(event, total)
+        val segments = when {
+            state == "completed" && total > 0L -> listOf(
+                TransferSegmentUi(0L, total, total, running = false)
+            )
+            parsedSegments.isNotEmpty() -> parsedSegments
+            else -> transfers[transferId]?.segments.orEmpty()
+        }
         val updated = TransferUiState(
             transferId = transferId,
             direction = direction,
@@ -258,11 +813,17 @@ object TransferManager {
             inFlightBytes = inFlight,
             totalBytes = total,
             activeWorkers = event.optInt("activeWorkers"),
+            allocatedWorkers = event.optInt("allocatedWorkers"),
             targetWorkers = event.optInt("targetWorkers"),
             speedBytesPerSecond = speed,
             elapsedMs = event.optLong("elapsedMs"),
+            stageBytes = stageBytes,
+            stageTotalBytes = stageTotalBytes,
             errorCode = errorCode,
             message = message,
+            segments = segments,
+            updatedAtMs = System.currentTimeMillis(),
+            diagnostics = diagnostics,
         )
         transfers[transferId] = updated
         activeTransferId.value = transferId
@@ -280,17 +841,36 @@ object TransferManager {
             "failed" -> "失败: ${message ?: errorCode ?: "未知错误"}"
             else -> state
         }
-        if (total > 0) progress.floatValue = (durable.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+        val projectedBytes = when {
+            state == "hashing" && stageTotalBytes > 0L -> stageBytes
+            state == "transferring" || state == "paused" -> saturatingAddBytes(durable, inFlight).coerceAtMost(total)
+            else -> durable
+        }
+        val projectedTotal = if (state == "hashing" && stageTotalBytes > 0L) stageTotalBytes else total
+        if (projectedTotal > 0L) {
+            progress.floatValue = (projectedBytes.toFloat() / projectedTotal.toFloat()).coerceIn(0f, 1f)
+            transferredBytes.value = projectedBytes
+            totalBytes.value = projectedTotal
+        }
         speedText.value = formatBytesPerSec(speed)
         if (state == "completed" || state == "cancelled") {
             cleanupOutgoingCache(transferId)
         }
-        if (state == "completed" && direction == "receive" && message != null) {
-            currentFileName.value = message
-            val dir = saveDir.value
-            if (dir.isNotBlank()) {
-                lastReceivedDirPath.value = dir
-                lastReceivedFilePath.value = File(dir, message).absolutePath
+        if (state in setOf("completed", "failed", "cancelled")) {
+            Log.i(
+                "TransferDiagnostics",
+                "id=$transferId state=$state hashMs=${diagnostics.hashingMs} " +
+                    "negotiateMs=${diagnostics.negotiatingMs} " +
+                    "transferMs=${diagnostics.transferringMs} verifyMs=${diagnostics.verifyingMs} " +
+                    "wire=${diagnostics.wireBytes} retransmit=${diagnostics.retransmittedBytes} " +
+                    "split=${diagnostics.splitTrials} rollback=${diagnostics.rollbacks} " +
+                    "retry=${diagnostics.retries} timeoutOrReset=${diagnostics.timeoutsOrResets}",
+            )
+        }
+        if (state == "completed" && direction == "receive") {
+            val completedName = message ?: fileName
+            if (completedName.isNotBlank()) {
+                publishCompletedIncoming(transferId, completedName)
             }
         }
     }
@@ -300,14 +880,35 @@ object TransferManager {
     fun retry(transferId: String): Boolean {
         if (RustSDK.retryTransfer(transferId)) return true
         val context = appContext ?: return false
-        val filePath = outgoingCachePaths[transferId] ?: return false
         val targetIp = outgoingTargets[transferId] ?: return false
+        val uriString = outgoingUris[transferId]
+        if (uriString != null) {
+            val uri = Uri.parse(uriString)
+            val fileName = outgoingFileNames[transferId].orEmpty()
+            val fileSize = outgoingFileSizes[transferId] ?: -1L
+            val newTransferId = sendSeekableUriDirect(context, targetIp, uri, fileName, fileSize)
+                ?: return false
+            registerOutgoingUriTransfer(
+                context = context,
+                transferId = newTransferId,
+                uri = uri,
+                fileName = fileName,
+                fileSize = fileSize,
+                targetIp = targetIp,
+                replacesTransferId = transferId,
+            )
+            return true
+        }
+        val filePath = outgoingCachePaths[transferId] ?: return false
         if (!File(filePath).exists()) return false
         val newTransferId = RustSDK.sendFile(targetIp, filePath)
-        context.getSharedPreferences("localsend_outgoing", MODE_PRIVATE).edit().remove(transferId).apply()
-        outgoingCachePaths.remove(transferId)
-        outgoingTargets.remove(transferId)
-        registerOutgoingTransfer(context, newTransferId, filePath, targetIp)
+        registerOutgoingTransfer(
+            context = context,
+            transferId = newTransferId,
+            filePath = filePath,
+            targetIp = targetIp,
+            replacesTransferId = transferId,
+        )
         return true
     }
 
@@ -315,18 +916,47 @@ object TransferManager {
         val context = appContext ?: return
         val preferences = context.getSharedPreferences("localsend_outgoing", MODE_PRIVATE)
         val encoded = preferences.getString(transferId, null)
-        val persistedPath = runCatching { JSONObject(encoded ?: "").optString("filePath") }.getOrNull()
+        val persistedMeta = runCatching { JSONObject(encoded ?: "") }.getOrNull()
+        val persistedPath = persistedMeta?.optString("filePath")
+        val persistedUri = persistedMeta?.optString("uri")?.takeIf(String::isNotBlank)
         val path = outgoingCachePaths.remove(transferId) ?: persistedPath
         outgoingTargets.remove(transferId)
-        if (path != null) {
-            val file = File(path)
-            val outgoingRoot = File(context.cacheDir, "outgoing").canonicalFile
-            if (file.canonicalFile.path.startsWith(outgoingRoot.path + File.separator)) {
-                file.delete()
-                file.parentFile?.delete()
+        outgoingUris.remove(transferId)
+        outgoingFileNames.remove(transferId)
+        outgoingFileSizes.remove(transferId)
+        preferences.edit().remove(transferId).apply()
+        persistedUri?.let { uri ->
+            runCatching {
+                context.contentResolver.releasePersistableUriPermission(
+                    Uri.parse(uri),
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }.onFailure { error ->
+                Log.d("TransferManager", "持久 URI 权限无需释放或已失效: $uri", error)
             }
         }
-        preferences.edit().remove(transferId).apply()
+        if (path == null) return
+
+        cleanupScope.launch {
+            runCatching {
+                val outgoingRoot = File(context.cacheDir, "outgoing").canonicalFile
+                val file = File(path).canonicalFile
+                if (!isStrictFileDescendant(outgoingRoot, file)) {
+                    Log.w("TransferManager", "Refusing to delete outgoing path outside cache: $file")
+                    return@runCatching
+                }
+                if (!file.delete() && file.exists()) {
+                    Log.w("TransferManager", "Unable to delete outgoing cache file: $file")
+                    return@runCatching
+                }
+                val parent = file.parentFile
+                if (parent != null && parent != outgoingRoot && !parent.delete() && parent.exists()) {
+                    Log.w("TransferManager", "Unable to delete empty outgoing cache directory: $parent")
+                }
+            }.onFailure { error ->
+                Log.w("TransferManager", "Unable to clean outgoing cache for $transferId", error)
+            }
+        }
     }
 
     fun markIncomingNameCollision(originalName: String, tempPath: String) {
@@ -334,60 +964,16 @@ object TransferManager {
         collisionTempPath.value = tempPath
     }
 
-    fun finishTransfer(success: Boolean, msg: String) {
+    fun finishTransfer(success: Boolean, msg: String, completedSend: Boolean? = null) {
+        val wasSending = completedSend ?: isSending.value
         isTransferring.value = false
         progress.floatValue = if (success) 1.0f else 0f
         status.value = if (success) "传输成功" else "失败: $msg"
-        if (success && !isSending.value && msg.isNotBlank()) {
+        if (success && !wasSending && msg.isNotBlank()) {
             currentFileName.value = msg
         }
-        if (!isSending.value) {
-            val dir = saveDir.value
-            val originalName = collisionOriginalName.value
-            val tempPath = collisionTempPath.value
-            if (originalName != null && tempPath != null && dir.isNotBlank()) {
-                val tempFile = File(tempPath)
-                val receivedFile = File(dir, originalName)
-
-                if (success && receivedFile.exists()) {
-                    val finalName = nextAvailableName(dir, originalName)
-                    val finalFile = File(dir, finalName)
-                    val movedReceived = receivedFile.renameTo(finalFile)
-                    if (movedReceived) {
-                        val restored = tempFile.renameTo(File(dir, originalName))
-                        if (restored) {
-                            currentFileName.value = finalName
-                            lastReceivedDirPath.value = dir
-                            lastReceivedFilePath.value = finalFile.absolutePath
-                            noticeText.value = "检测到同名文件，已自动保存为：$finalName"
-                            return
-                        } else {
-                            noticeText.value = "同名文件处理部分失败：原文件未能恢复为原名"
-                            lastReceivedDirPath.value = dir
-                            lastReceivedFilePath.value = finalFile.absolutePath
-                            currentFileName.value = finalName
-                            return
-                        }
-                    } else {
-                        noticeText.value = "检测到同名文件，但无法自动重命名，已保留为：$originalName"
-                    }
-                }
-
-                if (!success) {
-                    val originalPath = File(dir, originalName)
-                    if (!originalPath.exists() && tempFile.exists()) {
-                        tempFile.renameTo(originalPath)
-                    }
-                }
-            }
-        }
-
-        if (success && !isSending.value) {
-            val dir = saveDir.value
-            if (dir.isNotBlank() && currentFileName.value.isNotBlank()) {
-                lastReceivedDirPath.value = dir
-                lastReceivedFilePath.value = File(dir, currentFileName.value).absolutePath
-            }
+        if (success && !wasSending && msg.isNotBlank()) {
+            publishCompletedIncoming("legacy:$msg", msg)
         }
     }
 }
@@ -413,6 +999,9 @@ internal fun tempNameForCollision(fileName: String): String {
 object AppSettings {
     private const val PREFS = "localsend_prefs"
     private const val KEY_SAVE_DIR = "save_dir"
+    private const val KEY_LEGACY_SAVE_DIR = "legacy_save_dir"
+    private const val KEY_STORAGE_VERSION = "storage_version"
+    private const val STORAGE_VERSION = 2
     private const val KEY_DEVICE_ID = "device_id"
 
     fun getDeviceId(context: Context): String {
@@ -425,22 +1014,47 @@ object AppSettings {
     }
 
     fun getDefaultSaveDir(context: Context): String {
-        val publicDownloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        return File(publicDownloadDir, "localsend_yukon").absolutePath
+        context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)?.let { externalRoot ->
+            val externalStaging = File(externalRoot, "incoming")
+            if ((externalStaging.isDirectory || externalStaging.mkdirs()) && externalStaging.canWrite()) {
+                return externalStaging.absolutePath
+            }
+        }
+        val internalStaging = File(context.filesDir, "incoming")
+        if (!internalStaging.isDirectory) {
+            internalStaging.mkdirs()
+        }
+        return internalStaging.absolutePath
     }
 
     fun getSaveDir(context: Context): String {
         val prefs = context.getSharedPreferences(PREFS, MODE_PRIVATE)
+        val safeStagingDir = getDefaultSaveDir(context)
         val saved = prefs.getString(KEY_SAVE_DIR, null)
-        return saved?.takeIf { it.isNotBlank() } ?: getDefaultSaveDir(context)
+        if (saved != safeStagingDir || prefs.getInt(KEY_STORAGE_VERSION, 0) < STORAGE_VERSION) {
+            prefs.edit().apply {
+                if (!saved.isNullOrBlank() && saved != safeStagingDir) {
+                    putString(KEY_LEGACY_SAVE_DIR, saved)
+                }
+                putString(KEY_SAVE_DIR, safeStagingDir)
+                putInt(KEY_STORAGE_VERSION, STORAGE_VERSION)
+            }.apply()
+        }
+        return safeStagingDir
     }
 
-    fun setSaveDir(context: Context, dir: String) {
-        context.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_SAVE_DIR, dir).apply()
+    fun getLegacySaveDir(context: Context): String? {
+        return context.getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getString(KEY_LEGACY_SAVE_DIR, null)
+            ?.takeIf { it.isNotBlank() }
     }
 
     fun clearSaveDir(context: Context) {
-        context.getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_SAVE_DIR).apply()
+        context.getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .remove(KEY_SAVE_DIR)
+            .remove(KEY_LEGACY_SAVE_DIR)
+            .remove(KEY_STORAGE_VERSION)
+            .apply()
     }
 }
 
@@ -498,7 +1112,13 @@ class MainActivity : ComponentActivity() {
             Log.e("YukonTest", "Rust 发现服务启动失败 ${e.message}")
         }
 
-        val saveDirFromSettings = AppSettings.getSaveDir(this)
+        // Keep the Rust server and UI on one staging root for the lifetime of
+        // this process. A transient external-volume change must not make the
+        // UI look in a different directory while the existing server keeps
+        // writing to its original root.
+        val saveDirFromSettings = TransferManager.saveDir.value
+            .takeIf(String::isNotBlank)
+            ?: AppSettings.getSaveDir(this)
         val myDir = File(saveDirFromSettings)
         if (!myDir.exists()) {
             val created = myDir.mkdirs()
@@ -508,7 +1128,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val saveDir = myDir.absolutePath
-        TransferManager.saveDir.value = saveDir
+        TransferManager.initializeIncomingStorage(this, myDir)
         try {
             RustSDK.startFileServerSafe(saveDir)
             Log.d("YukonTest", "Rust 文件接收服务启动 (Safe)，保存路径: $saveDir")
@@ -520,6 +1140,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun setupMulticastLock() {
+        if (multicastLock?.isHeld == true) return
         val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         multicastLock = wifiManager.createMulticastLock("localsend_lock").apply {
             setReferenceCounted(true)
@@ -648,29 +1269,71 @@ fun DiscoveryScreen(
 
 
     val fileLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let {
             pendingTargetIp?.let { targetIp ->
                 appScope.launch {
-                    TransferManager.startTransfer("处理文件中...", true)
+                    runCatching {
+                        context.contentResolver.takePersistableUriPermission(
+                            it,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                        )
+                    }.onFailure { error ->
+                        Log.w("YukonSend", "无法持久化文件读取权限，将仅支持本次发送", error)
+                    }
+                    val info = withContext(Dispatchers.IO) { inspectOpenableFile(context, it) }
+                    if (info == null) {
+                        TransferManager.startTransfer("无法读取的文件", true)
+                        TransferManager.finishTransfer(false, "无法读取文件信息")
+                        onSwitchToStatus()
+                        return@launch
+                    }
+                    TransferManager.startTransfer(info.fileName, true, total = info.size.takeIf { size -> size >= 0L })
+                    TransferManager.updatePreparation(info.fileName, "正在打开文件...", 0L, info.size)
                     onSwitchToStatus()
 
-                    val realPath = withContext(Dispatchers.IO) {
-                        copyUriToCache(context, it)
+                    val directTransferId = withContext(Dispatchers.IO) {
+                        sendSeekableUriDirect(context, targetIp, it, info.fileName, info.size)
                     }
-
-                    if (realPath != null) {
-                        val fileObj = File(realPath)
-                        TransferManager.currentFileName.value = File(realPath).name
-                        Log.d("YukonSend", "开始发送文件: $realPath -> $targetIp")
-                        // 3. 调用 Rust 发送
-                        val transferId = withContext(Dispatchers.IO) {
-                            RustSDK.sendFile(targetIp, realPath)
-                        }
-                        TransferManager.registerOutgoingTransfer(context, transferId, realPath, targetIp)
+                    if (directTransferId != null) {
+                        Log.d("YukonSend", "使用可随机读取 FD 直接发送: $it -> $targetIp")
+                        TransferManager.registerOutgoingUriTransfer(
+                            context = context,
+                            transferId = directTransferId,
+                            uri = it,
+                            fileName = info.fileName,
+                            fileSize = info.size,
+                            targetIp = targetIp,
+                        )
                     } else {
-                        TransferManager.finishTransfer(false, "文件解析失败")
+                        TransferManager.updatePreparation(
+                            info.fileName,
+                            "源不支持随机读取，正在创建兼容缓存...",
+                            0L,
+                            info.size,
+                        )
+                        val realPath = withContext(Dispatchers.IO) {
+                            copyUriToCache(context, it, info) { copied, total ->
+                                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                    TransferManager.updatePreparation(
+                                        info.fileName,
+                                        "源不支持随机读取，正在创建兼容缓存...",
+                                        copied,
+                                        total,
+                                    )
+                                }
+                            }
+                        }
+                        if (realPath != null) {
+                            Log.d("YukonSend", "兼容缓存完成，开始发送: $realPath -> $targetIp")
+                            val transferId = withContext(Dispatchers.IO) {
+                                RustSDK.sendFile(targetIp, realPath)
+                            }
+                            TransferManager.registerOutgoingTransfer(context, transferId, realPath, targetIp)
+                        } else {
+                            TransferManager.finishTransfer(false, "文件读取或缓存失败")
+                        }
                     }
                 }
             }
@@ -725,7 +1388,7 @@ fun DiscoveryScreen(
                             onClick = {
                                 pendingTargetIp = ip
                                 // 打开系统文件选择器，过滤所有文件
-                                fileLauncher.launch("*/*")
+                                fileLauncher.launch(arrayOf("*/*"))
                             }
                         )
                     }
@@ -757,6 +1420,60 @@ fun DeviceItem(name: String, ip: String, onClick: () -> Unit) {
 }
 
 @Composable
+fun SegmentedTransferProgressIndicator(
+    segments: List<TransferSegmentUi>,
+    totalBytes: Long,
+    fallbackProgress: Float,
+    modifier: Modifier = Modifier,
+) {
+    val trackColor = MaterialTheme.colorScheme.surfaceVariant
+    val runningColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.28f)
+    val downloadedColor = MaterialTheme.colorScheme.primary
+    val hasSegments = totalBytes > 0L && segments.isNotEmpty()
+    val total = totalBytes.coerceAtLeast(1L).toDouble()
+
+    Canvas(modifier = modifier) {
+        val radius = size.height / 2f
+        drawRoundRect(
+            color = trackColor,
+            size = size,
+            cornerRadius = CornerRadius(radius, radius),
+        )
+
+        if (!hasSegments) {
+            val fallbackWidth = size.width * fallbackProgress.coerceIn(0f, 1f)
+            if (fallbackWidth > 0f) {
+                drawRoundRect(
+                    color = downloadedColor,
+                    size = Size(fallbackWidth, size.height),
+                    cornerRadius = CornerRadius(radius, radius),
+                )
+            }
+            return@Canvas
+        }
+
+        fun drawInterval(start: Long, end: Long, color: androidx.compose.ui.graphics.Color) {
+            val left = ((start.toDouble() / total) * size.width).toFloat().coerceIn(0f, size.width)
+            val right = ((end.toDouble() / total) * size.width).toFloat().coerceIn(left, size.width)
+            if (right <= left) return
+            drawRoundRect(
+                color = color,
+                topLeft = Offset(left, 0f),
+                size = Size(right - left, size.height),
+                cornerRadius = CornerRadius(radius, radius),
+            )
+        }
+
+        segments.filter(TransferSegmentUi::running).forEach { segment ->
+            drawInterval(segment.start, segment.end, runningColor)
+        }
+        segments.forEach { segment ->
+            drawInterval(segment.start, segment.downloadedEnd, downloadedColor)
+        }
+    }
+}
+
+@Composable
 fun ReceiveScreen() {
     val status by TransferManager.status
     val fileName by TransferManager.currentFileName
@@ -767,7 +1484,8 @@ fun ReceiveScreen() {
     val context = LocalContext.current
     val receivedPath by TransferManager.lastReceivedFilePath
     val receivedDir by TransferManager.lastReceivedDirPath
-    val transferStates = TransferManager.transfers.values.toList()
+    val activeTransferId by TransferManager.activeTransferId
+    val activeTransfer = activeTransferId?.let(TransferManager.transfers::get)
 
     var ipList by remember { mutableStateOf<List<NetworkInfo>>(emptyList()) }
 
@@ -838,8 +1556,10 @@ fun ReceiveScreen() {
             Spacer(modifier = Modifier.height(8.dp))
         }
 
-        LinearProgressIndicator(
-            progress = { progress },
+        SegmentedTransferProgressIndicator(
+            segments = activeTransfer?.segments.orEmpty(),
+            totalBytes = activeTransfer?.totalBytes ?: 0L,
+            fallbackProgress = progress,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(8.dp),
@@ -853,34 +1573,13 @@ fun ReceiveScreen() {
             Text(text = "速度: $speed", style = MaterialTheme.typography.bodyMedium)
         }
 
-        if (transferStates.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(16.dp))
-            transferStates.takeLast(4).forEach { transfer ->
-                Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Text(transfer.fileName, style = MaterialTheme.typography.titleSmall)
-                        Text(
-                            "${transfer.direction} · ${transfer.state} · worker ${transfer.activeWorkers}/${transfer.targetWorkers}",
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                        val durableProgress = if (transfer.totalBytes > 0) {
-                            transfer.durableBytes.toFloat() / transfer.totalBytes.toFloat()
-                        } else if (transfer.state == "completed") 1f else 0f
-                        LinearProgressIndicator(
-                            progress = { durableProgress.coerceIn(0f, 1f) },
-                            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            if (transfer.state !in setOf("completed", "failed", "cancelled")) {
-                                TextButton(onClick = { TransferManager.cancel(transfer.transferId) }) { Text("取消") }
-                            }
-                            if (transfer.state == "failed") {
-                                TextButton(onClick = { TransferManager.retry(transfer.transferId) }) { Text("重试") }
-                            }
-                        }
-                    }
-                }
-            }
+        if (isTransferring && activeTransfer != null) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "并发: ${activeTransfer.activeWorkers}/${activeTransfer.allocatedWorkers} · 目标 ${activeTransfer.targetWorkers}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
         }
 
         if (!isTransferring && status == "传输成功" && (receivedPath != null || receivedDir != null)) {
@@ -907,29 +1606,11 @@ fun ReceiveScreen() {
 @Composable
 fun SettingsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
-    var currentDir by remember { mutableStateOf(AppSettings.getSaveDir(context)) }
-    var inputDir by remember { mutableStateOf(currentDir) }
-
-    val treePicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        val data = result.data
-        val uri = data?.data
-        if (result.resultCode == Activity.RESULT_OK && uri != null) {
-            val flags = data.flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            try {
-                context.contentResolver.takePersistableUriPermission(uri, flags)
-            } catch (_: Exception) {
-            }
-
-            val path = tryResolveTreeToFilePath(context, uri)
-            if (path.isNullOrBlank()) {
-                Toast.makeText(context, "该目录无法解析为文件路径，暂不支持", Toast.LENGTH_LONG).show()
-            } else {
-                inputDir = path
-            }
-        }
+    val stagingDir = remember {
+        TransferManager.saveDir.value.takeIf { it.isNotBlank() }
+            ?: AppSettings.getSaveDir(context)
     }
+    val legacyDir = remember { AppSettings.getLegacySaveDir(context) }
 
     Scaffold(
         topBar = {
@@ -950,97 +1631,74 @@ fun SettingsScreen(onBack: () -> Unit) {
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text("下载保存位置", style = MaterialTheme.typography.titleMedium)
-            Text("当前: $currentDir", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
-
-            OutlinedTextField(
-                value = inputDir,
-                onValueChange = { inputDir = it },
-                label = { Text("自定义目录路径") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
+            Text("接收与导出", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "接收暂存位置（应用专属）",
+                style = MaterialTheme.typography.labelLarge,
+            )
+            Text(
+                stagingDir,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+            Text(
+                "Rust 只写入上面的应用专属目录，不会直接写公共 Downloads。",
+                style = MaterialTheme.typography.bodyMedium,
             )
 
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Button(onClick = {
-                    val dir = inputDir.trim()
-                    if (dir.isBlank()) {
-                        Toast.makeText(context, "目录不能为空", Toast.LENGTH_SHORT).show()
-                        return@Button
-                    }
-                    val f = File(dir)
-                    if (!f.exists()) f.mkdirs()
-                    if (!f.exists() || !f.isDirectory) {
-                        Toast.makeText(context, "目录不可用: $dir", Toast.LENGTH_LONG).show()
-                        return@Button
-                    }
-                    AppSettings.setSaveDir(context, f.absolutePath)
-                    currentDir = AppSettings.getSaveDir(context)
-                    TransferManager.saveDir.value = currentDir
-                    Toast.makeText(context, "已保存（重启后对接收服务生效）", Toast.LENGTH_LONG).show()
-                }) {
-                    Text("保存")
-                }
+            HorizontalDivider()
+            Text("公开下载位置", style = MaterialTheme.typography.labelLarge)
+            Text(
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    "接收完成后自动导出到 Downloads/$PUBLIC_DOWNLOAD_SUBDIRECTORY；应用通过 content URI 打开文件，并保留应用专属副本用于 Done 丢包与断点恢复。"
+                } else {
+                    "Android 10 以下不自动导出；完成后可从应用专属暂存位置打开文件。"
+                },
+                style = MaterialTheme.typography.bodyMedium,
+            )
 
-                OutlinedButton(onClick = {
-                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-                        addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
-                    }
-                    treePicker.launch(intent)
-                }) {
-                    Text("选择文件夹")
-                }
-            }
-
-            OutlinedButton(onClick = {
-                AppSettings.clearSaveDir(context)
-                currentDir = AppSettings.getSaveDir(context)
-                inputDir = currentDir
-                TransferManager.saveDir.value = currentDir
-                Toast.makeText(context, "已恢复默认（重启后对接收服务生效）", Toast.LENGTH_LONG).show()
-            }) {
-                Text("恢复默认位置")
+            if (legacyDir != null) {
+                HorizontalDivider()
+                Text("旧保存路径已停用", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    "$legacyDir\n为适配 scoped storage，该路径不再交给 Rust；其中已有文件不会被删除。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
             }
         }
     }
 }
 
-private fun tryResolveTreeToFilePath(context: Context, treeUri: Uri): String? {
-    if (!DocumentsContract.isTreeUri(treeUri)) return null
-    val docId = try {
-        DocumentsContract.getTreeDocumentId(treeUri)
-    } catch (_: Exception) {
-        return null
-    }
-    val parts = docId.split(":")
-    if (parts.size != 2) return null
-    val volume = parts[0]
-    val rel = parts[1].trimStart('/')
-    val base = if (volume == "primary") {
-        Environment.getExternalStorageDirectory().absolutePath
+private fun openFile(context: Context, fileLocation: String?) {
+    if (fileLocation.isNullOrBlank()) return
+    val parsed = Uri.parse(fileLocation)
+    val isContentUri = parsed.scheme.equals("content", ignoreCase = true)
+    val uri: Uri
+    val mime: String
+
+    if (isContentUri) {
+        uri = parsed
+        mime = context.contentResolver.getType(uri)
+            ?: mimeTypeForName(uri.lastPathSegment.orEmpty())
     } else {
-        "/storage/$volume"
-    }
-    return if (rel.isBlank()) base else "$base/$rel"
-}
-
-private fun openFile(context: Context, filePath: String?) {
-    if (filePath.isNullOrBlank()) return
-    val file = File(filePath)
-    if (!file.exists()) {
-        Toast.makeText(context, "文件不存在: $filePath", Toast.LENGTH_LONG).show()
-        return
-    }
-
-    val ext = file.extension.lowercase()
-    val mimeFromExt = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
-    val mime = mimeFromExt ?: URLConnection.guessContentTypeFromName(file.name) ?: "*/*"
-
-    val uri = try {
-        FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-    } catch (_: Exception) {
-        Uri.fromFile(file)
+        val file = if (parsed.scheme.equals("file", ignoreCase = true)) {
+            parsed.path?.let(::File)
+        } else {
+            File(fileLocation)
+        }
+        if (file == null || !file.isFile) {
+            Toast.makeText(context, "文件不存在: $fileLocation", Toast.LENGTH_LONG).show()
+            return
+        }
+        uri = try {
+            FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        } catch (error: Exception) {
+            Log.e("MainActivity", "Unable to share received file", error)
+            Toast.makeText(context, "无法安全打开该文件", Toast.LENGTH_LONG).show()
+            return
+        }
+        mime = mimeTypeForName(file.name)
     }
 
     val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -1056,6 +1714,19 @@ private fun openFile(context: Context, filePath: String?) {
 
 private fun openFolder(context: Context, dirPath: String?) {
     if (dirPath.isNullOrBlank()) return
+    val parsed = Uri.parse(dirPath)
+    if (parsed.scheme.equals("content", ignoreCase = true)) {
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            data = parsed
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            context.startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(context, "系统未找到可打开文件夹的应用", Toast.LENGTH_LONG).show()
+        }
+        return
+    }
     val dir = File(dirPath)
     if (!dir.exists() || !dir.isDirectory) {
         Toast.makeText(context, "文件夹不存在: $dirPath", Toast.LENGTH_LONG).show()
@@ -1064,8 +1735,10 @@ private fun openFolder(context: Context, dirPath: String?) {
 
     val uri = try {
         FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", dir)
-    } catch (_: Exception) {
-        Uri.fromFile(dir)
+    } catch (error: Exception) {
+        Log.e("MainActivity", "Unable to share received directory", error)
+        Toast.makeText(context, "无法安全打开该文件夹", Toast.LENGTH_LONG).show()
+        return
     }
 
     val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -1079,26 +1752,100 @@ private fun openFolder(context: Context, dirPath: String?) {
     }
 }
 
-fun copyUriToCache(context: Context, uri: Uri): String? {
+data class OpenableFileInfo(
+    val fileName: String,
+    val size: Long,
+)
+
+fun inspectOpenableFile(context: Context, uri: Uri): OpenableFileInfo? = runCatching {
+    var fileName = "temp_file"
+    var size = -1L
+    context.contentResolver.query(
+        uri,
+        arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+        null,
+        null,
+        null,
+    )?.use { cursor ->
+        if (cursor.moveToFirst()) {
+            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (nameIndex >= 0 && !cursor.isNull(nameIndex)) {
+                fileName = File(cursor.getString(nameIndex)).name.ifBlank { "temp_file" }
+            }
+            val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+            if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) size = cursor.getLong(sizeIndex)
+        }
+    }
+    if (size < 0L) {
+        context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+            size = descriptor.statSize
+        }
+    }
+    OpenableFileInfo(fileName, size)
+}.onFailure { error ->
+    Log.e("YukonSend", "读取文档信息失败: $uri", error)
+}.getOrNull()
+
+fun sendSeekableUriDirect(
+    context: Context,
+    targetIp: String,
+    uri: Uri,
+    fileName: String,
+    declaredSize: Long,
+): String? {
+    var rawFd: Int? = null
+    return try {
+        context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+            Os.lseek(descriptor.fileDescriptor, 0L, OsConstants.SEEK_CUR)
+            val size = descriptor.statSize.takeIf { it >= 0L } ?: declaredSize
+            if (size < 0L) return null
+            rawFd = descriptor.detachFd()
+            val sourceKey = "${uri}|$size"
+            val transferId = RustSDK.sendFileDescriptor(targetIp, rawFd!!, fileName, size, sourceKey)
+            rawFd = null // Rust owns the detached descriptor after JNI returns.
+            transferId.takeIf(String::isNotBlank)
+        }
+    } catch (error: Exception) {
+        rawFd?.let { detached ->
+            runCatching { ParcelFileDescriptor.adoptFd(detached).close() }
+        }
+        Log.i("YukonSend", "文档不支持可随机读取 FD，切换到缓存兼容模式: $uri", error)
+        null
+    }
+}
+
+fun copyUriToCache(
+    context: Context,
+    uri: Uri,
+    info: OpenableFileInfo = inspectOpenableFile(context, uri) ?: OpenableFileInfo("temp_file", -1L),
+    onProgress: (copied: Long, total: Long) -> Unit = { _, _ -> },
+): String? {
     try {
         val contentResolver = context.contentResolver
-        var fileName = "temp_file"
-        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (index != -1) fileName = File(cursor.getString(index)).name
-            }
-        }
-
         val outgoingDir = File(context.cacheDir, "outgoing/${UUID.randomUUID()}")
         if (!outgoingDir.mkdirs() && !outgoingDir.isDirectory) return null
-        val cacheFile = File(outgoingDir, fileName)
+        val cacheFile = File(outgoingDir, info.fileName)
 
         contentResolver.openInputStream(uri)?.use { input ->
             FileOutputStream(cacheFile).use { output ->
-                input.copyTo(output)
+                val buffer = ByteArray(1024 * 1024)
+                var copied = 0L
+                var lastUpdate = 0L
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    if (count == 0) continue
+                    output.write(buffer, 0, count)
+                    copied += count
+                    val now = System.currentTimeMillis()
+                    if (now - lastUpdate >= 200L || (info.size >= 0L && copied >= info.size)) {
+                        onProgress(copied, info.size)
+                        lastUpdate = now
+                    }
+                }
+                onProgress(copied, info.size.takeIf { it >= 0L } ?: copied)
             }
-        }
+        } ?: return null
 
         return cacheFile.absolutePath
     } catch (e: Exception) {

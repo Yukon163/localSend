@@ -47,10 +47,10 @@ object RustSDK {
     }
 
     @JvmStatic
-    fun onTransferComplete(success: Boolean, msg: String) {
+    fun onTransferComplete(success: Boolean, msg: String, isSending: Boolean) {
         Log.d("RustSDK", "传输结束: $success")
         runOnMain {
-            TransferManager.finishTransfer(success, msg)
+            TransferManager.finishTransfer(success, msg, isSending)
         }
     }
 
@@ -90,6 +90,13 @@ object RustSDK {
     external fun discoverOnce(userAlias: String)
     private external fun startFileServer(saveDir: String)
     external fun sendFile(targetIp: String, filePath: String): String
+    external fun sendFileDescriptor(
+        targetIp: String,
+        fd: Int,
+        fileName: String,
+        fileSize: Long,
+        sourceKey: String,
+    ): String
     external fun cancelTransfer(transferId: String): Boolean
     external fun retryTransfer(transferId: String): Boolean
     external fun configureDeviceIdentity(deviceId: String, deviceName: String): Boolean
