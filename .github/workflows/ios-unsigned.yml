@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Check out source and Rust core
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -67,7 +67,7 @@ jobs:
             > "$GITHUB_WORKSPACE/LocalSend-iOS-unsigned.ipa.sha256"
 
       - name: Upload unsigned package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: LocalSend-iOS-unsigned-${{ github.sha }}
           path: |
