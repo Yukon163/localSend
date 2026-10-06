@@ -1,0 +1,59 @@
+name: LocalSendIOS
+
+options:
+  bundleIdPrefix: com.yukon
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "16.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+
+targets:
+  LocalSendIOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: LocalSendIOS
+        excludes:
+          - Info.plist
+    info:
+      path: LocalSendIOS/Info.plist
+    preBuildScripts:
+      - name: Build Rust transfer core
+        script: |
+          /bin/sh "$SRCROOT/Scripts/build-rust.sh"
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - "$(BUILT_PRODUCTS_DIR)/liblocalsend_core.a"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yukon.localsend.ios
+        PRODUCT_NAME: LocalSend
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_OBJC_BRIDGING_HEADER: LocalSendIOS/Bridge/LocalSendIOS-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(SRCROOT)/../locsd_lib/include"
+        LIBRARY_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(BUILT_PRODUCTS_DIR)"
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "-llocalsend_core"
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+
+schemes:
+  LocalSendIOS:
+    build:
+      targets:
+        LocalSendIOS: all
+    run:
+      config: Debug
+    archive:
+      config: Release

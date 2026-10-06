@@ -1,0 +1,77 @@
+name: Build unsigned iOS package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/ios
+    paths:
+      - "ios/**"
+      - "locsd_lib"
+      - ".github/workflows/ios-unsigned.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source and Rust core
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Install Rust iOS target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Build unsigned app
+        working-directory: ios
+        run: |
+          xcodebuild \
+            -project LocalSendIOS.xcodeproj \
+            -scheme LocalSendIOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/LocalSendDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            DEVELOPMENT_TEAM='' \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          APP_PATH="$RUNNER_TEMP/LocalSendDerivedData/Build/Products/Release-iphoneos/LocalSend.app"
+          test -d "$APP_PATH"
+          mkdir -p "$RUNNER_TEMP/package/Payload"
+          ditto "$APP_PATH" "$RUNNER_TEMP/package/Payload/LocalSend.app"
+          cd "$RUNNER_TEMP/package"
+          /usr/bin/zip -qry "$GITHUB_WORKSPACE/LocalSend-iOS-unsigned.ipa" Payload
+          shasum -a 256 "$GITHUB_WORKSPACE/LocalSend-iOS-unsigned.ipa" \
+            > "$GITHUB_WORKSPACE/LocalSend-iOS-unsigned.ipa.sha256"
+
+      - name: Upload unsigned package
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalSend-iOS-unsigned-${{ github.sha }}
+          path: |
+            LocalSend-iOS-unsigned.ipa
+            LocalSend-iOS-unsigned.ipa.sha256
+          if-no-files-found: error
+          retention-days: 14

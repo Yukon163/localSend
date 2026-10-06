@@ -1,6 +1,6 @@
-# LocalSend Android
+# LocalSend
 
-这是一个简单好用的局域网文件传输 App。它使用 **Kotlin** 和 **Jetpack Compose** 开发界面，核心传输功能由 **Rust** 强力驱动。
+这是一个简单好用的局域网文件传输 App。Android 端使用 **Kotlin + Jetpack Compose**，iOS 端使用 **SwiftUI**，核心传输功能均由 **Rust** 驱动。
 
 ## 主要功能
 
@@ -10,12 +10,14 @@
 - **尾段救援**：进度超过 75% 或活跃 worker 少于 8 时，把长尾安全拆给空闲 worker。
 - **Android 安全落盘**：先写应用专属 staging，再以可恢复、幂等方式发布到 `Downloads/localsend_yukon`。
 - **界面简洁**：现代化的设计，简单易懂。
+- **原生 iOS 端**：SwiftUI 界面，复用同一 Rust V3 协议，支持与 Android/Windows 互传。
 
 ## 技术概览
 
 - **开发语言**：Kotlin
 - **界面框架**：Jetpack Compose (Material3)
 - **核心逻辑**：Rust（Tokio + 独立文件句柄 seek 并发，通过 JNI 调用）
+- **iOS 界面**：Swift / SwiftUI（通过 C ABI 链接 Rust 静态库）
 
 ## liblocalsend_core.so 源码
 
@@ -28,6 +30,8 @@
 1. 克隆本项目到本地
 2. 使用 Android Studio 打开
 3. 连接 Android 设备并运行
+
+iOS 构建和 GitHub Actions 无签名包说明见 [`ios/README.md`](ios/README.md)。
 
 ## 项目结构
 
